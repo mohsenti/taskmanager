@@ -89,6 +89,9 @@ type
 
   TTaskManager = class(TThread)
   private
+    FAutoRun: boolean;
+    FFreeResourcesOnTerminate: boolean;
+    FOnFinish: TNotifyEvent;
     FOnPause: TNotifyEvent;
     FOnResume: TNotifyEvent;
 
@@ -96,7 +99,7 @@ type
     FResources: TResourceList;
 
     FTaskLock: TCriticalSection;
-    FWaitForTask:PRTLEvent;
+    FWaitForTask: PRTLEvent;
 
     FPaused: boolean;
 
@@ -105,9 +108,12 @@ type
 
     function CheckResources(ATask: TTask): boolean;
     function GetResource(AResourceClass: TResourceClass): TResource;
-    function GetTask(Index: Integer): TTask;
-    function GetTaskCount: Integer;
+    function GetTask(Index: integer): TTask;
+    function GetTaskCount: integer;
     procedure ReleaseTaskResources(ATask: TTask);
+
+    procedure DoFinish();
+
   protected
 
     procedure Execute; override;
@@ -126,12 +132,18 @@ type
     procedure Pause;
     procedure Resume;
 
-    property Tasks[Index:Integer]:TTask read GetTask;
-    property TaskCount:Integer read GetTaskCount;
+    property Tasks[Index: integer]: TTask read GetTask;
+    property TaskCount: integer read GetTaskCount;
 
-    property OnPause:TNotifyEvent read FOnPause write FOnPause;
-    property OnResume:TNotifyEvent read FOnResume write FOnResume;
+    property AutoRun: boolean read FAutoRun write FAutoRun;
+    property FreeResourcesOnTerminate: boolean
+      read FFreeResourcesOnTerminate write FFreeResourcesOnTerminate;
 
+    property Paused: boolean read FPaused;
+
+    property OnPause: TNotifyEvent read FOnPause write FOnPause;
+    property OnResume: TNotifyEvent read FOnResume write FOnResume;
+    property OnFinish: TNotifyEvent read FOnFinish write FOnFinish;
   end;
 
 implementation
@@ -141,7 +153,7 @@ implementation
 function TTaskManager.CheckResources(ATask: TTask): boolean;
 var
   AResource: TResource;
-  I: Integer;
+  I: integer;
 begin
   Result := False;
   for I := 0 to ATask.FResourcesClass.Count - 1 do
@@ -159,7 +171,7 @@ end;
 
 function TTaskManager.GetResource(AResourceClass: TResourceClass): TResource;
 var
-  I: Integer;
+  I: integer;
 begin
   for I := 0 to FResources.Count - 1 do
   begin
@@ -173,19 +185,19 @@ begin
   Result := nil;
 end;
 
-function TTaskManager.GetTask(Index: Integer): TTask;
+function TTaskManager.GetTask(Index: integer): TTask;
 begin
-  Result:=FTasks[Index];
+  Result := FTasks[Index];
 end;
 
-function TTaskManager.GetTaskCount: Integer;
+function TTaskManager.GetTaskCount: integer;
 begin
-  Result:=FTasks.Count;
+  Result := FTasks.Count;
 end;
 
 procedure TTaskManager.ReleaseTaskResources(ATask: TTask);
 var
-  I: Integer;
+  I: integer;
 begin
   for I := 0 to ATask.FResources.Count - 1 do
   begin
@@ -194,20 +206,34 @@ begin
   ATask.FResources.Clear;
 end;
 
+procedure TTaskManager.DoFinish;
+begin
+  Pause;
+  if (Assigned(FOnFinish)) then
+  begin
+    FOnFinish(Self);
+  end;
+end;
+
 procedure TTaskManager.Execute;
 var
   ATask: TTask;
-  Count, I: Integer;
+  Count, I: integer;
+  AResource: TResource;
 begin
   while not Terminated do
   begin
 
     if (FTasks.Count = 0) then
-       RTLeventWaitFor(FWaitForTask,1000);
+    begin
+      Synchronize(@DoFinish);
+      //RTLeventWaitFor(FWaitForTask, 1000);
+    end;
 
+    FTaskLock.Enter;
     Count := FTasks.Count;
     I := 0;
-    FTaskLock.Enter;
+
     while I < Count do
     begin
 
@@ -242,6 +268,43 @@ begin
     end;
     FTaskLock.Leave;
   end;
+
+  FTaskLock.Enter;
+  Count := FTasks.Count;
+
+  while Count > 0 do
+  begin
+
+    ATask := FTasks[0];
+    KillTask(ATask);
+    FTasks.Remove(ATask);
+    Dec(Count);
+    ReleaseTaskResources(ATask);
+    if (Assigned(ATask.FRunner)) then
+    begin
+      ATask.FRunner.Free;
+      Dec(FRunningTask);
+    end;
+    ATask.Free;
+
+  end;
+
+  Count := FResources.Count;
+
+  if (FFreeResourcesOnTerminate) then
+  begin
+    while Count > 0 do
+    begin
+
+      AResource := FResources[0];
+      FResources.Remove(AResource);
+      Dec(Count);
+      AResource.Free;
+
+    end;
+  end;
+
+  FTaskLock.Leave;
 end;
 
 constructor TTaskManager.Create;
@@ -250,18 +313,26 @@ begin
   FTasks := TTaskList.Create;
   FResources := TResourceList.Create;
   FTaskLock := TCriticalSection.Create;
-  FWaitForTask:=RTLEventCreate;
+  FWaitForTask := RTLEventCreate;
   FPaused := False;
-  FRunnerLimit:=1;
-  FRunningTask:=0;
+  FRunnerLimit := 1;
+  FRunningTask := 0;
+  FFreeResourcesOnTerminate := True;
 end;
 
 destructor TTaskManager.Destroy;
+var
+  I: integer;
 begin
-  //Todo:Free resources here
+  if (not Terminated) then
+  begin
+    Terminate;
+    WaitFor;
+  end;
   FResources.Free;
-  //Todo:Free tasks here
   FTasks.Free;
+  RTLeventdestroy(FWaitForTask);
+  FTaskLock.Free;
   inherited Destroy;
 end;
 
@@ -273,7 +344,8 @@ begin
     //Dec(FRunningTask);
   end;
   ATask.FState := tsKilled;
-  if (Assigned(ATask.FOnKilled)) then begin
+  if (Assigned(ATask.FOnKilled)) then
+  begin
     ATask.FOnKilled(ATask);
   end;
 end;
@@ -291,7 +363,7 @@ procedure TTaskManager.AddTask(ATask: TTask);
 begin
   FTasks.Add(ATask);
   ATask.RequestResources;
-  ATask.FState:=tsReady;
+  ATask.FState := tsReady;
   RTLeventSetEvent(FWaitForTask);
 end;
 
@@ -302,14 +374,24 @@ end;
 
 procedure TTaskManager.Pause;
 begin
+  if (FPaused) then
+    Exit;
   FTaskLock.Enter;
-  if (Assigned(FOnPause)) then FOnPause(Self);
+  FPaused := True;
+  if (Assigned(FOnPause)) then
+    FOnPause(Self);
 end;
 
 procedure TTaskManager.Resume;
 begin
+  if (not FPaused) then
+    Exit;
+  FPaused := False;
+  if (Suspended) then
+    Start;
   FTaskLock.Leave;
-  if (Assigned(FOnResume)) then FOnResume(Self);
+  if (Assigned(FOnResume)) then
+    FOnResume(Self);
 end;
 
 { TTaskRunner }
@@ -358,14 +440,14 @@ end;
 
 function TTask.GetResource(AResourceClass: TResourceClass): TResource;
 var
-  I: Integer;
+  I: integer;
 begin
   for I := 0 to FResources.Count - 1 do
   begin
     if (FResources.Items[I].ClassType = AResourceClass) then
     begin
       Result := FResources.Items[I];
-      Break;
+      Exit;
     end;
   end;
   Result := nil;
@@ -379,8 +461,8 @@ end;
 constructor TTask.Create(AOwner: TTaskManager);
 begin
   FOwner := AOwner;
-  FResources:=TResourceList.Create;
-  FResourcesClass:=TResourceClassList.Create;
+  FResources := TResourceList.Create;
+  FResourcesClass := TResourceClassList.Create;
 end;
 
 destructor TTask.Destroy;
